@@ -493,7 +493,9 @@ class HealthRecordsAPI {
             // Get category information for each record
             const recordsWithCategories = paginatedRecords.map(record => ({
                 ...record,
-                categoryInfo: this.database.categories.get(record.category)
+                categoryInfo: this.database.categories.get(record.category),
+                // Include FHIR resource if available, otherwise convert
+                fhirResource: record.fhirResource || this.convertToFHIRObservation(record)
             }));
 
             res.json({
@@ -539,7 +541,9 @@ class HealthRecordsAPI {
 
             const recordWithCategory = {
                 ...record,
-                categoryInfo: this.database.categories.get(record.category)
+                categoryInfo: this.database.categories.get(record.category),
+                // Include FHIR resource if available, otherwise convert
+                fhirResource: record.fhirResource || this.convertToFHIRObservation(record)
             };
 
             res.json({
@@ -597,22 +601,81 @@ class HealthRecordsAPI {
                 uploadedAt: new Date().toISOString()
             }));
 
-            // Create record
+            // Create FHIR-compliant Observation resource
+            const observationId = uuidv4();
+            const observation = {
+                resourceType: 'Observation',
+                id: observationId,
+                meta: {
+                    versionId: '1',
+                    lastUpdated: new Date().toISOString(),
+                    profile: ['http://hl7.org/fhir/StructureDefinition/Observation']
+                },
+                status: 'final',
+                category: [{
+                    coding: [{
+                        system: 'http://terminology.hl7.org/CodeSystem/observation-category',
+                        code: this.getFHIRCategoryCode(category),
+                        display: this.database.categories.get(category)?.name || category
+                    }]
+                }],
+                code: {
+                    coding: [{
+                        system: 'http://loinc.org',
+                        code: this.getLOINCCode(category),
+                        display: title
+                    }],
+                    text: title
+                },
+                subject: {
+                    reference: `Patient/${userId}`,
+                    display: req.user.email
+                },
+                effectiveDateTime: date ? new Date(date).toISOString() : new Date().toISOString(),
+                issued: new Date().toISOString(),
+                performer: [{
+                    reference: provider ? `Practitioner/${provider}` : `Patient/${userId}`,
+                    display: provider || req.user.email
+                }],
+                valueString: description || 'Health record document',
+                note: description ? [{
+                    text: description
+                }] : undefined,
+                component: files.length > 0 ? files.map((file, index) => ({
+                    code: {
+                        coding: [{
+                            system: 'http://loinc.org',
+                            code: '55107-7',
+                            display: 'Document'
+                        }]
+                    },
+                    valueAttachment: {
+                        contentType: file.mimetype,
+                        url: `/api/health-records/files/${observationId}/${file.filename}`,
+                        title: file.originalname,
+                        size: file.size
+                    }
+                })) : undefined
+            };
+
+            // Create legacy record structure for backward compatibility
             const record = {
-                id: uuidv4(),
+                id: observationId,
                 userId,
                 title,
                 category,
                 description,
                 date: date || new Date().toISOString().split('T')[0],
                 provider,
-                status: 'pending',
+                status: 'final',
                 important: important === 'true' || important === true,
                 shared: false,
                 tags: Array.isArray(tags) ? tags : (tags ? tags.split(',').map(t => t.trim()) : []),
                 files: fileData,
                 createdAt: new Date().toISOString(),
-                updatedAt: new Date().toISOString()
+                updatedAt: new Date().toISOString(),
+                // Add FHIR resource
+                fhirResource: observation
             };
 
             this.database.records.set(record.id, record);
@@ -627,6 +690,7 @@ class HealthRecordsAPI {
             res.status(201).json({
                 success: true,
                 data: record,
+                fhirResource: observation,
                 message: 'Record created successfully'
             });
 
@@ -1408,10 +1472,93 @@ class HealthRecordsAPI {
         });
     }
 
+    // FHIR Helper Methods
+    getFHIRCategoryCode(category) {
+        const categoryMap = {
+            'lab-results': 'laboratory',
+            'imaging': 'imaging',
+            'prescriptions': 'medication',
+            'discharge-summary': 'procedure',
+            'insurance': 'social-history',
+            'vaccination': 'procedure',
+            'specialist-reports': 'procedure',
+            'other': 'social-history'
+        };
+        return categoryMap[category] || 'social-history';
+    }
+
+    getLOINCCode(category) {
+        const loincMap = {
+            'lab-results': '11502-2',
+            'imaging': '18748-4',
+            'prescriptions': '10160-0',
+            'discharge-summary': '18842-5',
+            'insurance': '57828-6',
+            'vaccination': '11369-6',
+            'specialist-reports': '34117-2',
+            'other': '34117-2'
+        };
+        return loincMap[category] || '34117-2'; // Default to General purpose document
+    }
+
+    // Convert existing record to FHIR Observation
+    convertToFHIRObservation(record) {
+        return {
+            resourceType: 'Observation',
+            id: record.id,
+            meta: {
+                versionId: '1',
+                lastUpdated: record.updatedAt,
+                profile: ['http://hl7.org/fhir/StructureDefinition/Observation']
+            },
+            status: record.status === 'final' ? 'final' : 'preliminary',
+            category: [{
+                coding: [{
+                    system: 'http://terminology.hl7.org/CodeSystem/observation-category',
+                    code: this.getFHIRCategoryCode(record.category),
+                    display: this.database.categories.get(record.category)?.name || record.category
+                }]
+            }],
+            code: {
+                coding: [{
+                    system: 'http://loinc.org',
+                    code: this.getLOINCCode(record.category),
+                    display: record.title
+                }],
+                text: record.title
+            },
+            subject: {
+                reference: `Patient/${record.userId}`
+            },
+            effectiveDateTime: new Date(record.date).toISOString(),
+            issued: record.createdAt,
+            valueString: record.description || 'Health record document',
+            note: record.description ? [{
+                text: record.description
+            }] : undefined,
+            component: record.files && record.files.length > 0 ? record.files.map(file => ({
+                code: {
+                    coding: [{
+                        system: 'http://loinc.org',
+                        code: '55107-7',
+                        display: 'Document'
+                    }]
+                },
+                valueAttachment: {
+                    contentType: file.mimetype,
+                    url: `/api/health-records/files/${record.id}/${file.filename}`,
+                    title: file.originalName || file.filename,
+                    size: file.size
+                }
+            })) : undefined
+        };
+    }
+
     start() {
         this.app.listen(this.port, () => {
             console.log(`🏥 Health Records API running on port ${this.port}`);
             console.log(`📝 Available at: http://localhost:${this.port}/api/health-records/`);
+            console.log(`🏥 FHIR Resources: http://localhost:3003/fhir/`);
         });
     }
 }
